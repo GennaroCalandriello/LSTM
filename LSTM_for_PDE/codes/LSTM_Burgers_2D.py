@@ -16,8 +16,8 @@ lr          = hp.LR
 epochs      = hp.EPOCHS
 N_data      = hp.N_SAMPLES
 N_colloc    = hp.N_COLLOCATION
-λ_data      = hp.LAMBDA_DATA
-λ_pde       = hp.LAMBDA_PDE
+lambda_data      = hp.LAMBDA_DATA
+lambda_pde       = hp.LAMBDA_PDE
 
 # Domain bounds
 x_lb, x_ub = -1.0, 1.0
@@ -80,7 +80,7 @@ def compute_losses():
     r  = pde_res(model, x_coll, y_coll, t_coll)
     Lp = mse(r, torch.zeros_like(r))
     # weighted
-    return λ_data * Ld + λ_pde * Lp, Ld, Lp
+    return lambda_data * Ld + lambda_pde * Lp, Ld, Lp
 
 # 7) Training loop
 def train():
