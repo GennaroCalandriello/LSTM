@@ -1,83 +1,97 @@
+# LSTM_NS_2d_analysis.py
+
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import torch
-import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
+import matplotlib.animation as animation
 
-# 1) Re-define the model architecture
-class LSTMPINN(nn.Module):
-    def __init__(self, in_dim=3, hidden_dim=64, num_layers=2, out_dim=3):
-        super().__init__()
-        self.lstm = nn.LSTM(in_dim, hidden_dim, num_layers, batch_first=True)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, out_dim)
-        )
-    def forward(self, x):
-        h, _ = self.lstm(x)           # → (batch, seq_len, hidden_dim)
-        y = self.fc(h)                # → (batch, seq_len, out_dim)
-        return y
+from temp2 import LSTM_PINN_NS2D, sphere_noslip_mask
+import hyperpar as hp
 
-# 2) Load the trained model
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = LSTMPINN().to(device)
-model.load_state_dict(torch.load("models/LSTM_PINN_NS2D.pth", map_location=device))
+# 1) Hyperparameters & device
+device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+hidden_size = hp.HIDDEN_SIZE
+num_layers  = hp.NUM_LAYERS
+x_lb, x_ub  = hp.X_LB, hp.X_UB
+y_lb, y_ub  = hp.Y_LB, hp.Y_UB
+t_lb, t_ub  = hp.T_LB, 200
+
+Nx, Ny, Nt  = 200, 200, 200      # grid resolution
+batch_size  = 200                # evaluation batch size
+xc, yc, r   = 0.5, 0.0, 0.4      # must match temp2.py
+
+# 2) Load trained model
+model = LSTM_PINN_NS2D(hidden_size=hidden_size,
+                       num_layers=num_layers).to(device)
+model.load_state_dict(torch.load(
+    "models/LSTM_NS2d_improved.pth", map_location=device))
 model.eval()
 
-# 3) Build a spatial grid and time‐vector
-nx, ny = 50, 50
-x = np.linspace(0, 1, nx)
-y = np.linspace(0, 1, ny)
-X, Y = np.meshgrid(x, y)            # shapes: (ny, nx)
-xy_flat = np.stack([X.ravel(), Y.ravel()], axis=1)  # (nx*ny, 2)
+# 3) Build (x,y,t) grid
+x = np.linspace(x_lb, x_ub, Nx)
+y = np.linspace(y_lb, y_ub, Ny)
+t = np.linspace(t_lb, t_ub, Nt)
+Xg, Yg, Tg = np.meshgrid(x, y, t, indexing='ij')  # shape [Nx,Ny,Nt]
 
-nt = 100
-T_final = 1.0
-times = np.linspace(0, T_final, nt)
+# 4) Obstacle mask on XY plane (True=fluid region)
+mask_xy = ~sphere_noslip_mask(
+    torch.tensor(Xg[:,:,0], dtype=torch.float32),
+    torch.tensor(Yg[:,:,0], dtype=torch.float32)
+).cpu().numpy()
 
-# 4) Utility to compute (U,V,ω) at a single time
-def eval_uvomega(t_scalar):
-    # prepare torch input
-    t_col = np.full((nx*ny,1), t_scalar, dtype=np.float32)
-    inp = np.concatenate([xy_flat.astype(np.float32), t_col], axis=1)
-    with torch.no_grad():
-        T = torch.from_numpy(inp).to(device).unsqueeze(1)  # (N,1,3)
-        uvp = model(T).squeeze(1).cpu().numpy()           # (N,3)
-    U = uvp[:,0].reshape((ny,nx))
-    V = uvp[:,1].reshape((ny,nx))
-    # finite‐difference vorticity
-    dx = x[1] - x[0]
-    dy = y[1] - y[0]
-    dvdx = np.gradient(V, axis=1) / dx
-    dudy = np.gradient(U, axis=0) / dy
-    omega = dvdx - dudy
-    return U, V, omega
+# 5) Flatten to feed the network
+x_flat = torch.tensor(Xg.ravel(), dtype=torch.float32).view(-1,1).to(device)
+y_flat = torch.tensor(Yg.ravel(), dtype=torch.float32).view(-1,1).to(device)
+t_flat = torch.tensor(Tg.ravel(), dtype=torch.float32).view(-1,1).to(device)
 
-# 5) Set up the figure
-fig, ax = plt.subplots(figsize=(6,6))
-U0, V0, ω0 = eval_uvomega(times[0])
-# quiver for velocity
-Q = ax.quiver(X, Y, U0, V0, pivot='middle', scale=50)
-# colormap for vorticity
-C = ax.imshow(ω0, origin='lower',
-              extent=(0,1,0,1),
-              cmap='RdBu', alpha=0.6)
-cb = fig.colorbar(C, ax=ax, label='Vorticity')
-title = ax.set_title(f"$t={times[0]:.2f}$")
+# derive φ flatten
+phi_flat = (torch.sqrt((x_flat-xc)**2 + (y_flat-yc)**2) - r)
+
+# 6) Evaluate u over the grid in batches
+u_list = []
+with torch.no_grad():
+    for i in range(0, x_flat.shape[0], batch_size):
+        xb  = x_flat[i : i+batch_size]
+        yb  = y_flat[i : i+batch_size]
+        tb  = t_flat[i : i+batch_size]
+        phb = phi_flat[i : i+batch_size]
+        u_b, _, _ = model(xb, yb, tb, phb)
+        u_list.append(u_b.cpu().numpy())
+
+u_flat = np.vstack(u_list)           # (Nx*Ny*Nt, 1)
+U_xyz   = u_flat.reshape(Nx, Ny, Nt) # [Nx,Ny,Nt]
+U_txy   = np.transpose(U_xyz, (2,0,1))   # [Nt,Nx,Ny]
+U_mask  = np.where(mask_xy[None,:,:], U_txy, np.nan)
+
+# 7) Precompute vmin/vmax for stable colorbar
+vmin, vmax = np.nanmin(U_mask), np.nanmax(U_mask)
+
+# 8) Animate u(x,y) over time
+fig, ax = plt.subplots(figsize=(6,5))
+pcm = ax.pcolormesh(
+    x, y, U_mask[0].T,
+    shading='auto', cmap='viridis',
+    vmin=vmin, vmax=vmax
+)
+cbar = fig.colorbar(pcm, ax=ax, label='u(x,y)')
+ax.set_xlabel('x')
+ax.set_ylabel('y')
 
 def update(frame):
-    t = times[frame]
-    U, V, ω = eval_uvomega(t)
-    Q.set_UVC(U, V)
-    C.set_data(ω)
-    title.set_text(f"$t={t:.2f}$")
-    return Q, C, title
+    pcm.set_array(U_mask[frame].T.ravel())
+    ax.set_title(f't = {t[frame]:.3f}')
+    return pcm,
 
-ani = FuncAnimation(fig, update, frames=nt, interval=50, blit=False)
+ani = animation.FuncAnimation(
+    fig, update, frames=Nt, interval=100, blit=True
+)
 
-# To save as MP4 or GIF, uncomment one of these:
-# ani.save("ns2d_velocity_vorticity.mp4", writer="ffmpeg", dpi=150)
-# ani.save("ns2d_velocity_vorticity.gif", writer="pillow", fps=20)
+# Save GIF
+ani.save("u_evolution.gif", writer='pillow', fps=10)
+plt.close(fig)
 
-plt.show()
+if __name__ == "__main__":
+    print("✔ Saved u_evolution.gif")

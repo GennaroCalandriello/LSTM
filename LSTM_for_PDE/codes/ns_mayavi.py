@@ -1,84 +1,94 @@
-# ns3d_mayavi.py
-
+import torch
 import numpy as np
-from mayavi import mlab
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.patches import Circle
+import os
 
-# 1) Load precomputed data from your analysis step
-#    Replace these with your actual loading code or pass them in.
-#    U_masked: numpy array (Nt, Nz, Ny, Nx)
-#    V_masked, W_masked same shape
-#    x: length-Nx
-#    y: length-Ny
-#    z: length-Nz
-data = np.load("ns3d_data.npz")  
-U = data["U_masked"]
-V = data["V_masked"]
-W = data["W_masked"]
-x = data["x"]
-y = data["y"]
-z = data["z"]
-t = data["t"]  # length Nt
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# 2) Choose a time index to visualize
-t_idx = 10
+# 1) Import your trained PINN definition:
+from NS_2D_circle import LSTMPINN  
 
-# 3) Extract the 3D fields at that time
-u = U[ t_idx ]  # shape (Nz,Ny,Nx)? or (Ny,Nx,Nz) depending on your ordering
-v = V[ t_idx ]
-w = W[ t_idx ]
+# 2) Load model + weights
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = LSTMPINN().to(device)
+model.load_state_dict(torch.load("model/ns2d_lstm_circle.pth", map_location=device))
+model.eval()
 
-# If your arrays are (Nt,Nz,Ny,Nx), you need to reorder:
-#    u = U[t_idx].transpose(2,1,0)  # → (Nx,Ny,Nz)
-#    v = V[t_idx].transpose(2,1,0)
-#    w = W[t_idx].transpose(2,1,0)
-# And build X,Y,Z via meshgrid(x,y,z,indexing='ij') → (Nx,Ny,Nz)
+# 3) Problem parameters (must match training!)
+T_final = 2.0
+cx, cy, r = 2.7, 4.5, 0.0  # circle center & radius
 
-# Here we assume u,v,w are now (Nx,Ny,Nz):
-X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+# 4) Grid & times
+nx, ny = 200, 200
+x = np.linspace(0,9,nx)
+y = np.linspace(0,9,ny)
+X, Y = np.meshgrid(x,y)
+xy = np.stack([X.ravel(), Y.ravel()], axis=1)
+nt = 50
+times = np.linspace(0, T_final, nt)
 
-# Replace NaNs inside obstacle by zero so VTK can ingest the field
-u = np.nan_to_num(u)
-v = np.nan_to_num(v)
-w = np.nan_to_num(w)
+# 5) Evaluator (exactly as before, just masking the interior)
+def eval_uv_speed(t):
+    # build input tensors *with* requires_grad so we can differentiate
+    xx = torch.tensor(xy[:,0:1], dtype=torch.float32, device=device, requires_grad=True)
+    yy = torch.tensor(xy[:,1:2], dtype=torch.float32, device=device, requires_grad=True)
+    tt = torch.full_like(xx, float(t),                 device=device, requires_grad=True)
 
-# 4) Launch Mayavi figure
-mlab.figure(size=(800,600), bgcolor=(1,1,1))
+    inp = torch.cat([xx, yy, tt], dim=1).unsqueeze(1)    # (N,1,3)
 
-# 5) Create a vector field source
-src = mlab.pipeline.vector_field(X, Y, Z, u, v, w)
+    # 1) forward pass *WITHOUT* torch.no_grad()
+    out = model(inp).squeeze(1)                         # (N,2): [ψ, p]
+    psi = out[:, 0:1]
 
-# 6) Add an outline and axes for context
-mlab.outline(color=(0,0,0))
-mlab.axes(xlabel='x', ylabel='y', zlabel='z')
+    # 2) compute u, v via autograd
+    u = torch.autograd.grad(psi, yy,
+                            grad_outputs=torch.ones_like(psi),
+                            create_graph=False, retain_graph=True)[0]
+    v = -torch.autograd.grad(psi, xx,
+                             grad_outputs=torch.ones_like(psi),
+                             create_graph=False, retain_graph=True)[0]
 
-# 7) Add streamlines
-#    Seed them on a plane at x = x_lb, spanning y,z
-x0 = x[0]
-plane = mlab.pipeline.scalar_cut_plane(src,
-    plane_orientation='x_axes', slice_index=0)
-plane.implicit_plane.widget.enabled = False
+    # 3) detach & to‐numpy
+    u = u.detach().cpu().numpy().flatten()
+    v = v.detach().cpu().numpy().flatten()
+    speed = np.sqrt(u**2 + v**2)
 
-strm = mlab.pipeline.streamline(src,
-    seedtype='plane',
-    seed_visible=True,
-    seed_scale=1.0,
-    integration_direction='both',
-    colormap='autumn')
-strm.stream_tracer.maximum_propagation = 200
-strm.tube_filter.radius = 0.005
+    # 4) mask inside the circle
+    dist2 = (xy[:,0]-cx)**2 + (xy[:,1]-cy)**2
+    mask = dist2 < r**2
+    u[   mask] = np.nan
+    v[   mask] = np.nan
+    speed[mask] = np.nan
 
-# 8) (Optional) Add an isosurface of speed
-speed = np.sqrt(u*u + v*v + w*w)
-iso = mlab.pipeline.iso_surface(
-    mlab.pipeline.scalar_field(X, Y, Z, speed),
-    contours=[0.5*speed.max()],
-    opacity=0.3,
-    colormap='Blues'
-)
+    return u.reshape(ny,nx), v.reshape(ny,nx), speed.reshape(ny,nx)
 
-# 9) Add a colorbar for speed if desired
-mlab.scalarbar(object=iso, title='|u|')
 
-# 10) Show the scene
-mlab.view(azimuth=45, elevation=60, distance='auto')
-mlab.show()
+# 6) Build figure + add the circle patch once
+fig, ax = plt.subplots(figsize=(6,5))
+speed0 = eval_uv_speed(times[0])[2]
+im = ax.imshow(speed0, origin='lower', extent=(0,1,0,1), cmap='viridis')
+cb = fig.colorbar(im, ax=ax, label='speed |v|')
+ax.set_xlabel('x'); ax.set_ylabel('y')
+# draw the obstacle
+# circle = Circle((cx,cy), r, facecolor='white', edgecolor='black', lw=1.5)
+# ax.add_patch(circle)
+title = ax.set_title(f"speed |v|(t={times[0]:.2f})")
+
+def animate(i):
+    ax.clear()
+    u, v, sp = eval_uv_speed(times[i])
+    im = ax.imshow(sp, origin='lower', extent=(0,1,0,1), cmap='viridis')
+    # redraw the circle
+    circle = Circle((cx,cy), r, facecolor='white', edgecolor='black', lw=1.5)
+    ax.add_patch(circle)
+    ax.set_xlabel('x'); ax.set_ylabel('y')
+    ax.set_title(f"speed |v|(t={times[i]:.2f})")
+    return [im]
+
+ani = animation.FuncAnimation(fig, animate,
+                              frames=nt, interval=200, blit=True)
+
+plt.tight_layout()
+plt.show()
