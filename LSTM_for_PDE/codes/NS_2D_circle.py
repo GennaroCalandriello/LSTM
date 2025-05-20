@@ -1,154 +1,163 @@
+import os
 import torch
 import torch.nn as nn
 import numpy as np
+import hyperpar as hp
 
-# Disable cuDNN (for strict reproducibility)
+# 0) Riproducibilità
 torch.backends.cudnn.enabled = False
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# PDE parameter
-nu      = 0.0001
-T_final = 1.0
+# 1) Parametri PDE e rete
+nu          = hp.NU
+hidden_size = hp.HIDDEN_SIZE
+num_layers  = hp.NUM_LAYERS
+lr          = hp.LR
+epochs      = hp.EPOCHS
 
-# Numbers of points
-N_f = 20000   # collocation
-N_i = 2000    # initial‐condition
-N_b = 2000    # boundary
+# 2) Numeri di punti
+N_ic     = hp.N_IC
+N_coll   = hp.N_COLLOCATION
+N_bc_obs = hp.N_OBSTACLE   # punti SUL contorno del cerchio
+# (non più “interni” ma proprio sul perimetro)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# 3) Dominio
+x_lb, x_ub = hp.X_LB, hp.X_UB
+y_lb, y_ub = hp.Y_LB, hp.Y_UB
+t_lb, t_ub = hp.T_LB, hp.T_UB
+lambda_ic = hp.LAMBDA_IC
+lambda_pde = hp.LAMBDA_PDE
+lambda_bc = hp.LAMBDA_BC
 
-# 1) LSTM‐based PINN: outputs stream‐function ψ and pressure p
-class LSTMPINN(nn.Module):
-    def __init__(self, in_dim=3, hidden_dim=64, num_layers=2, out_dim=2):
+# 4) Sampling dei punti
+
+# 4.1) Initial condition: qui mettiamo il profilo di inlet uniforme
+#      come condizione in t=0 su tutto il dominio fluido.
+x0 = x_lb + (x_ub - x_lb) * torch.rand(N_ic,1)
+y0 = y_lb + (y_ub - y_lb) * torch.rand(N_ic,1)
+t0 = torch.zeros_like(x0)
+
+# fuori ostacolo
+mask0 = ((x0 - 0.5)**2 + (y0 - 0.0)**2) >= 0.4**2
+x0, y0, t0 = [v[mask0].reshape(-1, 1) for v in (x0, y0, t0)]
+
+# target IC: flusso uniforme U_INLET
+u0_target = torch.full_like(x0, hp.U_INLET)
+v0_target = torch.zeros_like(x0)
+
+x0, y0, t0, u0_target, v0_target = [v.to(device) for v in (x0,y0,t0,u0_target,v0_target)]
+
+
+# 4.2) Collocation (interno fluido, random)
+xc = x_lb + (x_ub - x_lb) * torch.rand(N_coll,1)
+yc = y_lb + (y_ub - y_lb) * torch.rand(N_coll,1)
+tc = t_lb + (t_ub - t_lb) * torch.rand(N_coll,1)
+maskc = ((xc - 0.5)**2 + (yc - 0.0)**2) >= 0.4**2
+xc, yc, tc = [v[maskc].reshape(-1, 1) for v in (xc, yc, tc)]
+#device
+xc, yc, tc = [v.to(device).requires_grad_() for v in (xc, yc, tc)]
+
+
+# 4.3) Boundary sul cerchio (no-slip)
+theta = 2*np.pi * torch.rand(N_bc_obs,1)
+xb = 0.5 + 0.4*torch.cos(theta)
+yb = 0.0 + 0.4*torch.sin(theta)
+tb = t_lb + (t_ub - t_lb)*torch.rand_like(xb)
+
+xb, yb, tb = [v.to(device).requires_grad_() for v in (xb,yb,tb)]
+
+
+# 5) Definizione del modello
+class LSTM_PINN_NS2D(nn.Module):
+    def __init__(self, in_dim=3, hidden=64, layers=2):
         super().__init__()
-        self.lstm = nn.LSTM(in_dim, hidden_dim, num_layers, batch_first=True)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, out_dim)
-        )
-    def forward(self, x):
-        # x: (batch, seq_len, in_dim)
-        h, _ = self.lstm(x)            # → (batch, seq_len, hidden_dim)
-        return self.fc(h)              # → (batch, seq_len, out_dim)
+        self.rnn = nn.LSTM(in_dim, hidden, layers, batch_first=True)
+        self.fc  = nn.Linear(hidden, 3)
+    def forward(self, x, y, t):
+        # costruisco sequenza (batch,seq=1,3)
+        seq = torch.cat([x,y,t], dim=-1).unsqueeze(1)
+        h, _ = self.rnn(seq)                # → (batch,1,hidden)
+        uvp = self.fc(h[:, -1, :])          # → (batch,3)
+        u = uvp[:,0:1];  v = uvp[:,1:2];  p = uvp[:,2:3]
+        return u, v, p
+
+model = LSTM_PINN_NS2D(3, hidden_size, num_layers).to(device)
 
 
-# 2) PINN trainer with circular obstacle
-class NavierStokesLSTM:
-    def __init__(self, cx=0.5, cy=0.5, r=0.1):
-        # ---- collocation points outside the circle ----
-        Xf = torch.rand(int(1.2*N_f),1, device=device)
-        Yf = torch.rand(int(1.2*N_f),1, device=device)
-        Tf = torch.rand(int(1.2*N_f),1, device=device) * T_final
-        mask_f = ((Xf - cx)**2 + (Yf - cy)**2) >= r**2
+# 6) Residui Navier–Stokes
+def NS_residuals(x,y,t):
+    # assicuro i gradienti
+    for v in (x,y,t):
+        v.requires_grad_(True)
+    u,v,p = model(x,y,t)
+    one = torch.ones_like(u)
 
-        self.x_f = Xf[mask_f][:N_f].unsqueeze(1).requires_grad_()
-        self.y_f = Yf[mask_f][:N_f].unsqueeze(1).requires_grad_()
-        self.t_f = Tf[mask_f][:N_f].unsqueeze(1).requires_grad_()
+    # derivate prime
+    u_t = torch.autograd.grad(u, t, grad_outputs=one, create_graph=True)[0]
+    v_t = torch.autograd.grad(v, t, grad_outputs=one, create_graph=True)[0]
+    u_x = torch.autograd.grad(u, x, grad_outputs=one, create_graph=True)[0]
+    u_y = torch.autograd.grad(u, y, grad_outputs=one, create_graph=True)[0]
+    v_x = torch.autograd.grad(v, x, grad_outputs=one, create_graph=True)[0]
+    v_y = torch.autograd.grad(v, y, grad_outputs=one, create_graph=True)[0]
+    p_x = torch.autograd.grad(p, x, grad_outputs=one, create_graph=True)[0]
+    p_y = torch.autograd.grad(p, y, grad_outputs=one, create_graph=True)[0]
 
-        # ---- initial‐condition points outside circle, at t=0 ----
-        X0 = torch.rand(int(1.2*N_i),1, device=device)
-        Y0 = torch.rand(int(1.2*N_i),1, device=device)
-        mask_0 = ((X0 - cx)**2 + (Y0 - cy)**2) >= r**2
+    # laplaciani
+    u_xx = torch.autograd.grad(u_x, x, grad_outputs=one, create_graph=True)[0]
+    u_yy = torch.autograd.grad(u_y, y, grad_outputs=one, create_graph=True)[0]
+    v_xx = torch.autograd.grad(v_x, x, grad_outputs=one, create_graph=True)[0]
+    v_yy = torch.autograd.grad(v_y, y, grad_outputs=one, create_graph=True)[0]
 
-        self.x0 = X0[mask_0][:N_i].unsqueeze(1).requires_grad_()
-        self.y0 = Y0[mask_0][:N_i].unsqueeze(1).requires_grad_()
-        self.t0 = torch.zeros(self.x0.size(0),1, device=device).requires_grad_()
+    # equazioni
+    continuity = u_x + v_y
+    momentum_x = u_t + (u*u_x + v*u_y) + p_x - nu*(u_xx + u_yy)
+    momentum_y = v_t + (u*v_x + v*v_y) + p_y - nu*(v_xx + v_yy)
 
-        # Taylor–Green vortex initial velocity
-        self.u0 = -0.1 * torch.cos(np.pi*self.x0) * torch.sin(np.pi*self.y0)
-        self.v0 =  0.1 * torch.sin(np.pi*self.x0) * torch.cos(np.pi*self.y0)
-
-        # ---- boundary (circle) points for no‐slip ----
-        theta = 2*np.pi * torch.rand(N_b,1, device=device)
-        self.x_b = (cx + r*torch.cos(theta)).requires_grad_()
-        self.y_b = (cy + r*torch.sin(theta)).requires_grad_()
-        self.t_b = (torch.rand(N_b,1, device=device) * T_final).requires_grad_()
-        self.null_b = torch.zeros(N_b,1, device=device)
-
-        # ---- null targets for PDE residuals ----
-        self.null_f = torch.zeros(N_f,1, device=device)
-        self.null_g = torch.zeros(N_f,1, device=device)
-
-        # build network & optimizer
-        self.net = LSTMPINN().to(device)
-        self.mse = nn.MSELoss()
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=1e-3)
+    return momentum_x, momentum_y, continuity
 
 
-    def residuals(self, x, y, t):
-        # x,y,t: (batch,1)
-        inp = torch.cat([x, y, t], dim=1).unsqueeze(1)   # → (batch,1,3)
-        out = self.net(inp).squeeze(1)                   # → (batch,2)
-        psi, p = out[:,0:1], out[:,1:2]
+# 7) Funzione di loss
+mse = nn.MSELoss()
+def compute_losses():
+    # 7.1 IC loss
+    u0_pred, v0_pred, _ = model(x0,y0,t0)
+    L_ic = mse(u0_pred, u0_target) + mse(v0_pred, v0_target)
 
-        # velocities via stream‐function
-        u =  torch.autograd.grad(psi, y, grad_outputs=torch.ones_like(psi), create_graph=True)[0]
-        v = -torch.autograd.grad(psi, x, grad_outputs=torch.ones_like(psi), create_graph=True)[0]
+    # 7.2 PDE loss
+    mx, my, cont = NS_residuals(xc,yc,tc)
+    L_pde = mse(mx, torch.zeros_like(mx)) \
+          + mse(my, torch.zeros_like(my)) \
+          + mse(cont, torch.zeros_like(cont))
 
-        # first derivatives
-        u_t = torch.autograd.grad(u, t, grad_outputs=torch.ones_like(u), create_graph=True)[0]
-        u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
-        u_y = torch.autograd.grad(u, y, grad_outputs=torch.ones_like(u), create_graph=True)[0]
-        v_t = torch.autograd.grad(v, t, grad_outputs=torch.ones_like(v), create_graph=True)[0]
-        v_x = torch.autograd.grad(v, x, grad_outputs=torch.ones_like(v), create_graph=True)[0]
-        v_y = torch.autograd.grad(v, y, grad_outputs=torch.ones_like(v), create_graph=True)[0]
-        p_x = torch.autograd.grad(p, x, grad_outputs=torch.ones_like(p), create_graph=True)[0]
-        p_y = torch.autograd.grad(p, y, grad_outputs=torch.ones_like(p), create_graph=True)[0]
+    # 7.3 BC Loss (no-slip cerchio)
+    ub_pred, vb_pred, _ = model(xb,yb,tb)
+    L_bc = mse(ub_pred, torch.zeros_like(ub_pred)) \
+         + mse(vb_pred, torch.zeros_like(vb_pred))
 
-        # second derivatives
-        u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
-        u_yy = torch.autograd.grad(u_y, y, grad_outputs=torch.ones_like(u_y), create_graph=True)[0]
-        v_xx = torch.autograd.grad(v_x, x, grad_outputs=torch.ones_like(v_x), create_graph=True)[0]
-        v_yy = torch.autograd.grad(v_y, y, grad_outputs=torch.ones_like(v_y), create_graph=True)[0]
-
-        # momentum‐equation residuals
-        f = u_t + u*u_x + v*u_y + p_x - nu*(u_xx + u_yy)
-        g = v_t + u*v_x + v*v_y + p_y - nu*(v_xx + v_yy)
-
-        return u, v, p, f, g
+    # combinazione
+    L = lambda_ic*L_ic + lambda_pde*L_pde + lambda_bc*L_bc
+    return L, L_ic, L_pde, L_bc
 
 
-    def train(self, epochs, batch_f=2000, batch_b=2000, lambda_bc=10.0):
-        for epoch in range(1, epochs+1):
-            # 1) fluid‐domain collocation minibatch
-            idx_f = torch.randperm(self.x_f.size(0), device=device)[:batch_f]
-            x_f, y_f, t_f = self.x_f[idx_f], self.y_f[idx_f], self.t_f[idx_f]
+# 8) Training loop
+def train():
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    for ep in range(1, epochs+1):
+        opt.zero_grad()
+        L, L_ic, L_pde, L_bc = compute_losses()
+        L.backward()
+        opt.step()
 
-            # PDE residual losses
-            _, _, _, f_pred, g_pred = self.residuals(x_f, y_f, t_f)
-            loss_f = self.mse(f_pred, self.null_f[:batch_f])
-            loss_g = self.mse(g_pred, self.null_g[:batch_f])
+        if ep % 20 == 0:
+            print(f"[{ep:4d}/{epochs}] "
+                  f"Total={L.item():.2e} "
+                  f"IC={L_ic.item():.2e} "
+                  f"PDE={L_pde.item():.2e} "
+                  f"BC={L_bc.item():.2e}")
 
-            # 2) IC loss (all IC points)
-            u0_p, v0_p, _, _, _ = self.residuals(self.x0, self.y0, self.t0)
-            loss_ic = self.mse(u0_p, self.u0) + self.mse(v0_p, self.v0)
+    os.makedirs("models", exist_ok=True)
+    torch.save(model.state_dict(), "models/LSTM_NS2d.pth")
+    print("✅ Saved model")
 
-            # 3) no‐slip BC loss
-            idx_b = torch.randperm(self.x_b.size(0), device=device)[:batch_b]
-            u_b, v_b, _, _, _ = self.residuals(
-                self.x_b[idx_b], self.y_b[idx_b], self.t_b[idx_b]
-            )
-            loss_bc = self.mse(u_b, self.null_b[:batch_b]) + self.mse(v_b, self.null_b[:batch_b])
-
-            # 4) total loss
-            loss = loss_f + loss_g + loss_ic + lambda_bc * loss_bc
-
-            # 5) backward & step
-            self.optimizer.zero_grad()
-            loss.backward(retain_graph=True)
-            self.optimizer.step()
-
-            # 6) logging
-            if epoch % 10 == 0:
-                print(f"[{epoch:5d}/{epochs}] "
-                      f"PDE=({loss_f:.2e},{loss_g:.2e})  "
-                      f"IC={loss_ic:.2e}  BC={loss_bc:.2e}")
-
-        # save model
-        torch.save(self.net.state_dict(), "ns2d_lstm_circle.pth")
-        print("✅ Training complete, model saved to ns2d_lstm_circle.pth")
-
-
-if __name__ == "__main__":
-    pinn = NavierStokesLSTM(cx=0.5, cy=0.5, r=0.4)
-    pinn.train(epochs=500, batch_f=2000, batch_b=2000, lambda_bc=1.0)
+if __name__=="__main__":
+    train()

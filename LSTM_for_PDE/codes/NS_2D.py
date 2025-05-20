@@ -32,12 +32,14 @@ class LSTMPINN(nn.Module):
 
 # 2) Trainer for Navier–Stokes PINN with collocation + IC + minibatches
 class NavierStokesLSTM:
-    def __init__(self):
-        # Collocation points (x,y,t) ∈ [0,1]×[0,1]×[0,T]
+    def __init__(self, cx = 0.5, cy = 0.5, r = 0.4, N_b = 2000):
+        # Collocation points (x,y,t) ∈ [0,1]×[0,1]×[0,T], excluding the circle
+        # centered at (cx,cy) with radius r
         self.x_f = torch.rand(N_f,1, device=device, requires_grad=True)
         self.y_f = torch.rand(N_f,1, device=device, requires_grad=True)
         self.t_f = torch.rand(N_f,1, device=device, requires_grad=True) * T_final
 
+        
         # Initial‐condition points at t=0
         self.x0 = torch.rand(N_i,1, device=device, requires_grad=True)
         self.y0 = torch.rand(N_i,1, device=device, requires_grad=True)

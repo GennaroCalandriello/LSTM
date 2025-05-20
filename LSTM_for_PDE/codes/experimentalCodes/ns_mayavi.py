@@ -8,12 +8,12 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 # 1) Import your trained PINN definition:
-from NS_2D_circle2 import LSTMPINN  
+from LSTM_NS_2D import LSTM_PINN_NS2D
 
 # 2) Load model + weights
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = LSTMPINN().to(device)
-model.load_state_dict(torch.load("models/LSTM_NS2d.pth", map_location=device))
+model = LSTM_PINN_NS2D().to(device)
+model.load_state_dict(torch.load("model/ns2d_lstm_circle.pth", map_location=device))
 model.eval()
 
 # 3) Problem parameters (must match training!)
