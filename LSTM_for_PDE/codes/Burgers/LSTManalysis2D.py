@@ -11,6 +11,7 @@ import matplotlib.animation as animation
 from mpl_toolkits.mplot3d import Axes3D
 import hyperpar as hp
 from LSTM_Burgers2D_BC import obstacle_, LSTM_PINN
+from realBurgers2D import obstacle_, LSTM_PINN
 
 # 1) Hyperparameters & device
 device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -18,7 +19,7 @@ hidden_size = hp.HIDDEN_SIZE
 num_layers  = hp.NUM_LAYERS
 x_lb, x_ub  = hp.X_LB, hp.X_UB
 y_lb, y_ub  = hp.Y_LB, hp.Y_UB
-t_lb, t_ub  = hp.T_LB, 2
+t_lb, t_ub  = hp.T_LB, hp.T_UB
 Nx, Ny, Nt  = 400, 400, 20   # grid resolution
 
 # 2) Load trained model
@@ -33,7 +34,7 @@ t = np.linspace(t_lb, t_ub, Nt)
 Xg, Yg, Tg = np.meshgrid(x, y, t, indexing='ij')  # [Nx,Ny,Nt]
 
 # 4) Obstacle mask on XY plane: True = _fluid_ region = outside the circle
-mask_xy = ~obstacle_(Xg[:,:,0], Yg[:,:,0])  # invert so fluid is outside
+mask_xy = ~obstacle_(Xg[:,:,0], Yg[:,:,0], hp.cx, hp.cy, hp.r)  # invert so fluid is outside
 
 # 5) Flatten to feed through the network
 pts = Xg.ravel(), Yg.ravel(), Tg.ravel()
@@ -55,7 +56,7 @@ with torch.no_grad():
         yb = y_flat[i : i+batch_size]
         tb = t_flat[i : i+batch_size]
         u_batch = model(xb, yb, tb).cpu().numpy()
-        u_list.append(u_batch)
+        u_list.append(u_batch[0])
 
 u_flat = np.vstack(u_list)   # shape (Nx*Ny*Nt, 1)
 
@@ -161,5 +162,19 @@ if __name__ == "__main__":
     plot_colormap()
     animate_colormap("burgers2d_colormap.gif")
     animate_surface("burgers2d_surface.gif")
-    plot_losses()
+    # plot_losses()
     print("♠♠ Finished ♠♠")
+    x = np.linspace(hp.X_LB, hp.X_UB, hp.NX)
+    y = np.linspace(hp.Y_LB, hp.Y_UB, hp.NX)
+    X, Y = np.meshgrid(x, y, indexing='xy')
+    U = np.sin(np.pi * X) * np.sin(np.pi * Y)
+    #plot the initial condition
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(6, 4))
+    plt.pcolormesh(X, Y, U, shading='auto', cmap='viridis')
+    plt.colorbar(label='u(x,y)')
+    plt.title('Initial Condition at t=0')
+    plt.xlabel('x'); plt.ylabel('y')
+    plt.tight_layout()
+    plt.show()
+    

@@ -7,10 +7,8 @@ import hyperpar as hp
 # 0) Disable CuDNN for double‐backward
 torch.backends.cudnn.enabled = False
 
-initialCondition = ["TaylorGreen", "Gaussian"]
-indexIC = 2
-
-want_obstacle = True
+"""This is the main code DO NOT TOUCH!! GODDAMN"""
+want_obstacle = False
 # 1) Hyperparameters & device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 nu = hp.NU  # kinematic viscosity
@@ -18,7 +16,7 @@ rho = getattr(hp, 'RHO', 1.0)
 hidden_size = hp.HIDDEN_SIZE
 num_layers = hp.NUM_LAYERS
 lr = hp.LR
-epochs = 1000
+epochs = 200
 N_ic = hp.N_IC
 N_colloc = hp.N_COLLOCATION
 N_bc = hp.N_BC
@@ -33,45 +31,42 @@ t_lb, t_ub = hp.T_LB, hp.T_UB
 cx, cy, r = hp.cx, hp.cy, hp.r
 
 # 2) Taylor–Green analytic solution
-def initial_conditions(x, y, t):
-    """Taylor–Green vortex initial conditions"""
-    if indexIC == 0:
-            
-        exp2 = torch.exp(-2 * nu * t)
-        exp4 = torch.exp(-4 * nu * t)
-        u = torch.cos(x) * torch.sin(y)*exp2
-        v = -torch.sin(x) * torch.cos(y)*exp2
-        p = -rho / 4 * (torch.cos(2*x) + torch.cos(2*y))*exp4
-    
-    if indexIC == 1:
-        u = torch.exp(-((x - cx)**2 + (y - cy)**2) / (2 * r**2)) * torch.cos(x) * torch.sin(y)
-        v = torch.exp(-((x - cx)**2 + (y - cy)**2) / (2 * r**2)) * -torch.sin(x) * torch.cos(y)
-        p = -rho / 4 * (torch.cos(2*x) + torch.cos(2*y))
-    # base: zero everywhere
-    u = torch.zeros_like(x)
-    v = torch.zeros_like(x)
-    p = torch.zeros_like(x)
-
-    # only apply inlet profile at t=0
-    if indexIC == 2 and torch.allclose(t, torch.zeros_like(t)):
-        # inlet stripe (on the left wall) for y in [y_min,y_max]
-        y_min, y_max = 0.2, 0.8
-        U0 = 0.6
-        # define a small thickness delta over which x transitions
-        delta = 0.05*(x_ub - x_lb)
-
-        # mask for “inlet region”: x within [x_lb, x_lb+delta] AND y in stripe
-        inlet_mask = (
-            (x >= x_lb) & (x <= x_lb + delta) &
-            (y >= y_min) & (y <= y_max)
-        )
-        u[inlet_mask] = U0
-        v[inlet_mask] = 0.0
-        # pressure can stay zero (it will adjust via PINN)
-        p[inlet_mask] = 0.0
-         
+def taylor_green(x, y, t):
+    exp2 = torch.exp(-2 * nu * t)
+    exp4 = torch.exp(-4 * nu * t)
+    u = torch.cos(x) * torch.sin(y)*exp2
+    v = -torch.sin(x) * torch.cos(y)*exp2
+    p = -rho / 4 * (torch.cos(2*x) + torch.cos(2*y))*exp4
     return u, v, p
 
+
+def flow_velocity(x, y, t):
+    """Inlet slug of height deltaY next to the left wall at t=0."""
+    u0     = 0.1
+    deltaY = 0.1   # height of the inlet stripe [y_lb, y_lb+deltaY]
+    
+    # make sure x,y,t are column tensors [N,1]
+    x = x.view(-1,1)
+    y = y.view(-1,1)
+    t = t.view(-1,1)
+    
+    # base zero
+    u = torch.zeros_like(x)
+    v = torch.zeros_like(x)
+    
+    # only apply at initial time t=0
+    is_t0  = torch.isclose(t, torch.zeros_like(t))
+    # only apply along left wall x == x_lb (within floating tolerance)
+    at_wall = torch.isclose(x, torch.full_like(x, x_lb))
+    # only apply for y ∈ [y_lb, y_lb + deltaY]
+    in_stripe = (y >= y_lb) & (y <= y_lb + deltaY)
+    
+    mask = is_t0 & at_wall & in_stripe
+    u[mask] = u0
+    # v stays zero everywhere
+    
+    return u, v
+    
 def circle_mask(x, y, xc, yc, r):
     """Circle mask for obstacle"""
     
@@ -81,36 +76,67 @@ def circle_mask(x, y, xc, yc, r):
 # 3.1) Initial condition: interior, t=0
 x_ic = torch.rand(N_ic, 1)*(x_ub - x_lb) + x_lb
 y_ic = torch.rand(N_ic, 1)*(y_ub - y_lb) + y_lb
+# t_ic = torch.ones_like(x_ic)
 t_ic = torch.zeros_like(x_ic)
-
-mask_ic = ~circle_mask(x_ic, y_ic, cx, cy, r)
-x_ic, y_ic, t_ic = [t[mask_ic].reshape(-1, 1) for t in (x_ic, y_ic, t_ic)]
-u_ic, v_ic, p_ic = initial_conditions(x_ic, y_ic, t_ic)
+u_ic, v_ic, _ = taylor_green(x_ic, y_ic, t_ic)
+# u_ic, v_ic = flow_velocity(x_ic, y_ic, t_ic)
 
 
 # 3.2) Collocation points (interior)
 x_coll = torch.rand(N_colloc,1)*(x_ub-x_lb) + x_lb
 y_coll = torch.rand(N_colloc,1)*(y_ub-y_lb) + y_lb
 t_coll = torch.rand(N_colloc,1)*(t_ub-t_lb) + t_lb
-
 # Remove points inside the circle
-mask_coll = ~circle_mask(x_coll, y_coll, cx, cy, r)
-#zero around the circle, IC does respect the BC at time t=0
-x_coll = x_coll[mask_coll].reshape(-1,1)
-y_coll = y_coll[mask_coll].reshape(-1,1)
-t_coll = t_coll[mask_coll].reshape(-1,1)
+if want_obstacle:
+    mask_coll = ~circle_mask(x_coll, y_coll, cx, cy, r)
+    #zero around the circle, IC does respect the BC at time t=0
+    x_coll = x_coll[mask_coll].reshape(-1,1)
+    y_coll = y_coll[mask_coll].reshape(-1,1)
+    t_coll = t_coll[mask_coll].reshape(-1,1)
+    
+    mask_ic = ~circle_mask(x_ic, y_ic, cx, cy, r)
+    x_ic = x_ic[mask_ic].reshape(-1,1)
+    y_ic = y_ic[mask_ic].reshape(-1,1)
+    t_ic = t_ic[mask_ic].reshape(-1,1)
+    u_ic = u_ic[mask_ic].reshape(-1,1)
+    v_ic = v_ic[mask_ic].reshape(-1,1)
 
-x_ic, y_ic, t_ic, u_ic, v_ic, p_ic = [t.to(device) for t in (x_ic, y_ic, t_ic, u_ic, v_ic, p_ic)]
+x_ic, y_ic, t_ic, u_ic, v_ic = [t.to(device) for t in (x_ic, y_ic, t_ic, u_ic, v_ic)]
 x_coll, y_coll, t_coll = [t.to(device) for t in (x_coll, y_coll, t_coll)]
 
-
+# 3.3) Boundary: four walls
 def sample_boundary(N):
+    # N per side
+    xb = torch.linspace(x_lb, x_ub, N).unsqueeze(-1)
+    yb = y_lb * torch.ones_like(xb)
+    tb = torch.rand(N,1)*(t_ub-t_lb) + t_lb
+    xt, yt, tt = xb, y_ub*torch.ones_like(xb), torch.rand(N,1)*(t_ub-t_lb) + t_lb
+    yl = torch.linspace(y_lb, y_ub, N).unsqueeze(-1)
+    xl, tl = x_lb * torch.ones_like(yl), torch.rand(N,1)*(t_ub-t_lb) + t_lb
+    yr, xr, tr = yl, x_ub * torch.ones_like(yl), torch.rand(N,1)*(t_ub-t_lb) + t_lb
+    x_b = torch.cat([xb, xt, xl, xr], dim=0)
+    y_b = torch.cat([yb, yt, yl, yr], dim=0)
+    t_b = torch.cat([tb, tt, tl, tr], dim=0)
+    return x_b.to(device), y_b.to(device), t_b.to(device)
+
+x_bc, y_bc, t_bc = sample_boundary(N_bc)
+# u_bc, v_bc, _ = taylor_green(x_bc, y_bc, t_bc)
+u_bc, v_bc = torch.zeros_like(x_bc), torch.zeros_like(x_bc)
+# u_bc, v_bc = flow_velocity(x_bc, y_bc, t_bc)
+
+# 3.4) Cylinder obstacle noslip
+def sample_obstacle(N):
     theta = 2*torch.pi*torch.rand(N,1)
-    x_b = cx + r * torch.cos(theta)
-    y_b = cy + r * torch.sin(theta)
-    t_b = torch.rand(N,1)*(t_ub-t_lb) + t_lb
-    
-    return [f.to(device).requires_grad_() for f in (x_b, y_b, t_b)]
+    x_o = cx + r * torch.cos(theta)
+    y_o = cy + r * torch.sin(theta)
+    t_o = torch.rand(N,1)*(t_ub-t_lb) + t_lb
+    return x_o.to(device), y_o.to(device), t_o.to(device)
+
+x_obs, y_obs, t_obs = sample_obstacle(N_obs)
+# noslip target on obstacle surface (zero velocity)
+u_obs = torch.zeros_like(x_obs)
+v_obs = torch.zeros_like(y_obs)
+
 
 # 4) Define LSTM‐PINN model
 class LSTM_PINN_NS2D(nn.Module):
@@ -118,13 +144,12 @@ class LSTM_PINN_NS2D(nn.Module):
         super().__init__()
         self.rnn = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Sequential(
-            nn.Tanh(),
+            # nn.Tanh(),
             nn.Linear(hidden_size, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, 3),
-            nn.Tanh()
+            # nn.Tanh(),
+            # nn.Linear(hidden_size, 3),
+            # nn.Tanh()
         )
-        
     def forward(self, x, y, t):
         seq = torch.cat([x,y,t], dim=-1).unsqueeze(1)
         h, _ = self.rnn(seq)
@@ -133,38 +158,10 @@ class LSTM_PINN_NS2D(nn.Module):
 
 model = LSTM_PINN_NS2D(input_size, hidden_size, num_layers).to(device)
 
-def inlet_velocity():
-    # define your stripe in y
-    y_min, y_max = 0.2, 2
-    U0 = 2
-
-    # sample more than you need
-    x_in = torch.full((N_bc,1), x_lb,
-                    dtype=torch.float32, device=device)
-    y_in = torch.rand(N_bc,1, device=device)*(y_ub-y_lb) + y_lb
-    t_in = torch.rand(N_bc,1, device=device)*(t_ub-t_lb) + t_lb
-
-    # keep only the stripe + outside obstacle
-    mask_stripe = (y_in >= y_min) & (y_in <= y_max)
-    mask_fluid  = ~circle_mask(x_in, y_in, cx, cy, r)
-    mask_in     = (mask_stripe & mask_fluid).squeeze()
-
-    x_in = x_in[mask_in].reshape(-1,1)
-    y_in = y_in[mask_in].reshape(-1,1)
-    t_in = t_in[mask_in].reshape(-1,1)
-
-    u_in = torch.full((x_in.shape[0],1), U0,
-                    dtype=torch.float32, device=device)
-    v_in = torch.zeros_like(u_in)
-    return x_in, y_in, t_in, u_in, v_in
-
 # 5) PDE residuals
 def NS_res(x,y,t):
-    um, vm = 0.5, 0.5
     for g in (x,y,t): g.requires_grad_(True)
-    
     u,v,p = model(x,y,t)
-    
     ones = torch.ones_like(u)
     u_t = torch.autograd.grad(u, t, grad_outputs=ones, create_graph=True)[0]
     v_t = torch.autograd.grad(v, t, grad_outputs=ones, create_graph=True)[0]
@@ -178,92 +175,71 @@ def NS_res(x,y,t):
     u_yy = torch.autograd.grad(u_y, y, grad_outputs=ones, create_graph=True)[0]
     v_xx = torch.autograd.grad(v_x, x, grad_outputs=ones, create_graph=True)[0]
     v_yy = torch.autograd.grad(v_y, y, grad_outputs=ones, create_graph=True)[0]
-    
     continuity = u_x + v_y
     pu = u_t + (u*u_x + v*u_y) + p_x - nu*(u_xx+u_yy)
     pv = v_t + (u*v_x + v*v_y) + p_y - nu*(v_xx+v_yy)
-    entropy = (u-um)*u + (v-vm)*v 
-    
-    return pu, pv, continuity, entropy
+    return pu, pv, continuity
 
 # 6) Loss
 mse = nn.MSELoss()
+# def loss_functions():
+#     # IC loss vs analytic
+#     u0, v0, _ = model(x_ic, y_ic, t_ic)
+#     L_ic = mse(u0, u_ic) + mse(v0, v_ic)
+#     # PDE residual loss
+#     pu,pv,cont = NS_res(x_coll, y_coll, t_coll)
+#     L_pde = mse(pu, torch.zeros_like(pu)) + mse(pv, torch.zeros_like(pv)) + mse(cont, torch.zeros_like(cont))
+#     # Wall BC loss vs analytic
+#     u_b_pred, v_b_pred, _ = model(x_bc, y_bc, t_bc)
+#     L_bc = mse(u_b_pred, u_bc) + mse(v_b_pred, v_bc)
+#     # Obstacle noslip loss
+#     u_o_pred, v_o_pred, _ = model(x_obs, y_obs, t_obs)
+#     L_obs = mse(u_o_pred, u_obs) + mse(v_o_pred, v_obs)
+#     # Total loss
+#     L = hp.LAMBDA_DATA*L_ic + hp.LAMBDA_PDE*L_pde
+#     return L, L_ic, L_pde, L_bc, L_obs
 def loss_functions():
     # IC loss vs analytic
-    u0, v0, p0 = model(x_ic, y_ic, t_ic)
-    L_ic = mse(u0, u_ic) + mse(v0, v_ic) 
     # PDE residual loss
     pu,pv,cont = NS_res(x_coll, y_coll, t_coll)
+    # pu, pv, cont = NS_res(x_ic, y_ic, t_ic)
+    
     L_pde = mse(pu, torch.zeros_like(pu)) + mse(pv, torch.zeros_like(pv)) + mse(cont, torch.zeros_like(cont))
-   # BC loss
-    x_bc, y_bc, t_bc = sample_boundary(N_bc)
-    u_bc, v_bc, p_bc = model(x_bc, y_bc, t_bc)
-    L_bc = mse(u_bc, u_bc*0) + mse(v_bc, v_bc*0) 
-    L_tot = hp.LAMBDA_DATA*L_ic + hp.LAMBDA_PDE*L_pde + hp.LAMBDA_BC*L_bc
-    return L_tot, L_ic, L_pde, L_bc
+    #IC loss
+   #gaussiana
+    
+    
+    t_ic1 = torch.rand(N_ic, 1)*(t_ub - t_lb) + t_lb
+    t_ic1 = t_ic.to(device)
+    
+    # u_ic = torch.zeros_like(x_ic)
+    # v_ic = torch.zeros_like(x_ic)
+ 
+    # mask_t0 = torch.isclose(t_ic, torch.zeros_like(t_ic))
+    # p = torch.zeros_like(x_ic)
+    #     # linear pressure drop from P0→0
+    # P0 = 1.0
+    # p0 = P0*(1 - (x_ic - x_lb)/(x_ub - x_lb))
+    # p[mask_t0] = p0[mask_t0]
 
-def loss_functions2():
-    # 1) Initial‐condition loss (analytic)
-    u0_pred, v0_pred, _     = model(x_ic,  y_ic,  t_ic)
+    
+    u_ic = torch.exp(-((x_ic - cx)**2 + (y_ic - cy)**2)/3)
+    v_ic = torch.exp(-((x_ic - cx)**2 + (y_ic - cy)**2)/3)
+    # p_ic = torch.zeros_like(x_ic)
+    # p_ic = torch.exp(-((x_ic-x_ic/2)**2 + (y_ic-y_ic/2)**2)/5)
+    
+    
+    
+    
+    u0_pred, v0_pred, p0_pred = model(x_ic, y_ic, t_ic)
     L_ic = mse(u0_pred, u_ic) + mse(v0_pred, v_ic)
-
-    # 2) PDE residual + entropy loss
-    pu, pv, cont, entropy   = NS_res(x_coll, y_coll, t_coll)
-    L_pde     = (
-          mse(pu,   torch.zeros_like(pu))
-        + mse(pv,   torch.zeros_like(pv))
-        + mse(cont, torch.zeros_like(cont))
-    )
-    L_entropy = mse(entropy, torch.zeros_like(entropy))
-
-    # 3) No‐slip on cylinder
-    x_b, y_b, t_b            = sample_boundary(N_bc)
-    u_b_pred, v_b_pred, _    = model(x_b, y_b, t_b)
-    L_obs     = (
-          mse(u_b_pred, torch.zeros_like(u_b_pred))
-        + mse(v_b_pred, torch.zeros_like(v_b_pred))
-    )
-
-    # 4) Inlet BC at x = x_lb, u = U0, v = 0
-    x_in, y_in, t_in, u_in, v_in = inlet_velocity()
-    u_in_pred, v_in_pred, _       = model(x_in, y_in, t_in)
-    # L_in      = (
-    #       mse(u_in_pred, u_in)
-    #     + mse(v_in_pred, v_in)
-    # )
-
-    # 5) Outlet zero-gradient BC at x = x_ub: ∂u/∂x = 0
-    x_out = torch.full((N_bc,1), x_ub, dtype=torch.float32, device=device)
-    y_out = torch.rand(N_bc,1, device=device)*(y_ub-y_lb) + y_lb
-    t_out = torch.rand(N_bc,1, device=device)*(t_ub-t_lb) + t_lb
-    x_out.requires_grad_()
-    u_out_pred, _, _ = model(x_out, y_out, t_out)
-    u_x_out = torch.autograd.grad(
-        u_out_pred, x_out,
-        grad_outputs=torch.ones_like(u_out_pred),
-        create_graph=True
-    )[0]
-    L_out     = mse(u_x_out, torch.zeros_like(u_x_out))
-
-    # 6) Pressure gauge at outlet to fix constant offset
-    x_ref = torch.tensor([[x_ub]], dtype=torch.float32, device=device)
-    y_ref = torch.tensor([[cy]],   dtype=torch.float32, device=device)
-    t_ref = torch.zeros((1,1),     dtype=torch.float32, device=device)
-    _, _, p_ref             = model(x_ref, y_ref, t_ref)
-    L_p     = mse(p_ref, torch.zeros_like(p_ref))
-
-    # 7) Combine boundary‐condition losses
-    L_bc    = L_obs + L_out + L_p
-
-    # 8) Total loss
-    L_tot = (
-          hp.LAMBDA_DATA    * L_ic
-        + hp.LAMBDA_PDE     * L_pde
-        + hp.LAMBDA_ENTROPY * L_entropy
-        + hp.LAMBDA_BC      * L_bc
-    )
-
-    return L_tot, L_ic, L_pde, L_bc, L_entropy
+    
+    # Total loss
+    u_b_pred, v_b_pred, _ = model(x_bc, y_bc, t_bc)
+    L_bc = mse(u_b_pred, u_bc) + mse(v_b_pred, v_bc)
+    
+    L = L_ic
+    return L, L_ic, L_pde, L, L
 
 # 7) Training loop
 def train_noBatches():
@@ -274,23 +250,32 @@ def train_noBatches():
         "ic_loss": [],
         "obs_loss": []}
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    
-    for ep in range(1, epochs+1):
+    #pretrain on initial conditions
+    for ep in range(1, 200):
         opt.zero_grad()
-        L, L_ic, L_pde, L_bc, L_entropy = loss_functions2()
-        L.backward()
+        L_ic,_, _, _, _= loss_functions()
+        L_ic.backward()
         opt.step()
         if ep % 10 == 0:
-            print(f"Ep {ep}/{epochs}: L={L.item():.2e}, IC={L_ic.item():.2e}, PDE={L_pde.item():.2e}, BC={L_bc.item():.2e}, Entropy={L_entropy.item():.2e}")
+            print(f"Ep {ep}/{200}: L_ic={L_ic.item():.2e}")
+            
+    for ep in range(1, epochs+1):
+        opt.zero_grad()
+        L_ic, _, L_pde, _, _ = loss_functions()
+        L = L_ic
+        L.backward()
+        # L_pde.backward()
+        opt.step()
+        if ep % 10 == 0:
+            print(f"Ep {ep}/{epochs}: L_pde={L_pde.item():.2e}")
         # registro le losses
-        history["total_loss"].append(L.item())
-        history["pde_loss"].append(L_pde.item())
-        history["bc_loss"].append(L_bc.item())
-        history["ic_loss"].append(L_ic.item())
+        # history["total_loss"].append(L.item())
+        # history["pde_loss"].append(L_pde.item())
+        # history["bc_loss"].append(L_bc.item())
+        # history["ic_loss"].append(L_ic.item())
+        # history["obs_loss"].append(L_obs.item())
     # save
     # save model and los
-    os.makedirs('models', exist_ok=True)
-    os.makedirs("loss", exist_ok=True)
     if hp.SAVE_MODEL:
         try:
             os.remove("models/LSTM_NS2d_tg_cyl.pth")
@@ -304,9 +289,74 @@ def train_noBatches():
         except OSError:
             pass
         np.save("models/LSTM_NS2d_tg_cyl_loss.npy", history)
-        print(" Loss saved to models/LSTM_NS2d_tg_cyl_loss.npy")
+        print("Loss saved to models/LSTM_NS2d_tg_cyl_loss.npy")
 
+def train():
+    history={
+        "total_loss": [],
+        "pde_loss": [],
+        "bc_loss": [],
+        "ic_loss": [],
+        "obs_loss": []}
+    batch_size = 1280000
+    mse = nn.MSELoss()
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    for ep in range(1, epochs+1):
+        idx_ic  = np.random.choice(N_ic, batch_size, replace=False)
+        idx_coll = np.random.choice(N_colloc, batch_size, replace=False)
+        idx_bc   = np.random.choice(N_bc*4, batch_size, replace=False)
+        idx_obs  = np.random.choice(N_obs, batch_size, replace=False)
+        
+        # batch tensors xb, yb, tb are batches of x, y, t
+        xb_ic, yb_ic, tb_ic = x_ic[idx_ic], y_ic[idx_ic], t_ic[idx_ic]
+        ub_ic, vb_ic = u_ic[idx_ic], v_ic[idx_ic]
+        xb_coll, yb_coll,tb_coll = x_coll[idx_coll], y_coll[idx_coll], t_coll[idx_coll]
+        xb_bc, yb_bc, tb_bc, ub_bc, vb_bc = x_bc[idx_bc], y_bc[idx_bc], t_bc[idx_bc], u_bc[idx_bc], v_bc[idx_bc]
+        xb_obs, yb_obs, tb_obs, ub_obs, vb_obs = x_obs[idx_obs], y_obs[idx_obs], t_obs[idx_obs], u_obs[idx_obs], v_obs[idx_obs]
+        # losses
+        opt.zero_grad()
+        # IC
+        u0, v0, _ = model(xb_ic, yb_ic, tb_ic)
+        L_ic = mse(u0, ub_ic) +mse(v0, vb_ic)
+        # PDE
+        pu, pv, continuity = NS_res(xb_coll, yb_coll, tb_coll)
+        L_pde = mse(pu, 0*pu) + mse(pv, 0*pv) +mse(continuity, 0*continuity)
+        # BC walls
+        ub_pred, vb_pred, _ = model(xb_bc, yb_bc, tb_bc)
+        L_bc = mse(ub_pred, ub_bc) + mse(vb_pred, vb_bc)
+        # BC obs
+        uo_pred, vo_pred, _ = model(xb_obs, yb_obs, tb_obs)
+        L_obs = mse(uo_pred, ub_obs) + mse(vo_pred, vb_obs)
+        # total
+        L = hp.LAMBDA_DATA*L_ic + hp.LAMBDA_PDE*L_pde + hp.LAMBDA_OBS*L_obs
+        L.backward()
+        opt.step()
+        # registro le losses
+        history["total_loss"].append(L.item())
+        history["pde_loss"].append(L_pde.item())
+        history["bc_loss"].append(L_bc.item())
+        history["ic_loss"].append(L_ic.item())
+        history["obs_loss"].append(L_obs.item())
+        # print losses
+        if ep % 10 == 0:
+            print(f"Ep {ep}/{epochs}: L={L.item():.2e}, IC={L_ic.item():.2e}, PDE={L_pde.item():.2e}, BC={L_bc.item():.2e}, OBS={L_obs.item():.2e}")
+    # save
+    if hp.SAVE_MODEL:
+        try:
+            os.remove("models/LSTM_NS2d_tg_cyl.pth")
+        except OSError:
+            pass
+        torch.save(model.state_dict(), "models/LSTM_NS2d_tg_cyl.pth")
+        print("Model saved to models/LSTM_NS2d_tg_cyl.pth")
+    if hp.SAVE_LOSS:
+        try:
+            os.remove("models/LSTM_NS2d_tg_cyl_loss.npy")
+        except OSError:
+            pass
+        np.save("models/LSTM_NS2d_tg_cyl_loss.npy", history)
+        print("Loss saved to models/LSTM_NS2d_tg_cyl_loss.npy")
 if __name__ == '__main__':
-    
+    os.makedirs('models', exist_ok=True)
+    os.makedirs("loss", exist_ok=True)
     train_noBatches()
     # train()

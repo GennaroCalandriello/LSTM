@@ -6,8 +6,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-from LSTM_NS_2D import LSTM_PINN_NS2D, circle_mask
-# from temp import LSTM_PINN_NS2D, circle_mask
+# from LSTM_NS_2D import LSTM_PINN_NS2D, circle_mask
+from temp2 import LSTM_PINN_NS2D, circle_mask, circle_bool
 import hyperpar as hp
 
 # 1) Hyperparameters & device
@@ -16,11 +16,13 @@ hidden_size = hp.HIDDEN_SIZE
 num_layers  = hp.NUM_LAYERS
 x_lb, x_ub  = hp.X_LB, hp.X_UB
 y_lb, y_ub  = hp.Y_LB, hp.Y_UB
-t_lb, t_ub  = hp.T_LB, 10
+t_lb, t_ub  = hp.T_LB, hp.T_UB
 
-Nx, Ny, Nt  = 300, 300, 100      # grid resolution
+Nx, Ny, Nt  = 200, 200, 40      # grid resolution
 batch_size  = 10000              # evaluation batch size
 xc, yc, r   = hp.cx, hp.cy, hp.r  # circle center and radius
+
+if circle_bool == False: r = 0.0
 
 # 2) Load trained model
 def plotModel():
@@ -84,7 +86,7 @@ def plotModel():
         omega[:,:,k][~mask_xy] = np.nan
 
     # 8) Animate speed and vorticity side by side
-    vmin_s, vmax_s = np.nanmin(speed), np.nanmax(speed)
+    vmin_s, vmax_s = np.nanmin(speed), np.nanmax(speed)*0.4
     vmin_w, vmax_w = np.nanmin(omega), np.nanmax(omega)
     fig, axes = plt.subplots(1,2,figsize=(12,5))
     pcm1 = axes[0].pcolormesh(x, y, speed[:,:,0].T, shading='auto', cmap='viridis', vmin=vmin_s, vmax=vmax_s)
@@ -114,3 +116,4 @@ def plotLoss():
 if __name__ == "__main__":
     plotModel()
     plotLoss()
+    

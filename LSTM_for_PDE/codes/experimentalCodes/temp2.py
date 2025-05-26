@@ -4,280 +4,231 @@ import torch.nn as nn
 import numpy as np
 import hyperpar as hp
 
-# 0) Disable CuDNN for double‐backward through LSTM
+# 0) Disable CuDNN for double‐backward
 torch.backends.cudnn.enabled = False
 
+"""This is the main code DO NOT TOUCH!! GODDAMN"""
+
 # 1) Hyperparameters & device
-device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-nu           = hp.NU
-hidden_size  = hp.HIDDEN_SIZE
-num_layers   = hp.NUM_LAYERS
-lr           = hp.LR
-epochs       = hp.EPOCHS
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Numbers of sample points
-N_ic         = hp.N_IC
-N_colloc     = hp.N_COLLOCATION
-N_walls      = hp.N_WALLS
-N_obs        = hp.N_OBSTACLE
-N_inlet      = hp.N_INLET
-N_outlet     = hp.N_OUTLET
-
-# Loss weights (stronger obstacle enforcement)
-lambda_ic     = hp.LAMBDA_IC
-lambda_pde    = hp.LAMBDA_PDE
-lambda_walls  = hp.LAMBDA_BC
-lambda_obs    = hp.LAMBDA_OBS * 10
-lambda_inlet  = hp.LAMBDA_INLET
-lambda_outlet = hp.LAMBDA_OUTLET
+nu = hp.NU  # kinematic viscosity
+rho = getattr(hp, 'RHO', 1.0)
+hidden_size = hp.HIDDEN_SIZE
+num_layers = hp.NUM_LAYERS
+lr = hp.LR
+epochs = 200
+N_ic = hp.N_IC
+N_colloc = hp.N_COLLOCATION
+N_bc = hp.N_BC
+N_obs = hp.N_OBSTACLE  # # obstacle‐condition points
+input_size = 3  # (x,y,t)
 
 # Domain bounds
-x_lb, x_ub = hp.X_LB, hp.X_UB
-y_lb, y_ub = hp.Y_LB, hp.Y_UB
-t_lb, t_ub = hp.T_LB, 20
+x_lb, x_ub, y_lb, y_ub = hp.X_LB, hp.X_UB, hp.Y_LB, hp.Y_UB
+t_lb, t_ub = hp.T_LB, hp.T_UB
+circle_bool = True
+# Cylinder parameters
+cx, cy, r = hp.cx, hp.cy, hp.r
+    
+def circle_mask(x, y, xc, yc, r):
+    """Circle mask for obstacle"""
+    
+    return (x-xc)**2 + (y-yc)**2 < r**2
 
-# Obstacle geometry
-xc, yc, r = 0.5, 0.0, 0.4
+def sample_collocation(N):
+    x = torch.rand(N, 1)*(x_ub-x_lb) + x_lb
+    y = torch.rand(N, 1)*(y_ub-y_lb) + y_lb
+    t = torch.rand(N, 1)*(t_ub-t_lb) + t_lb
+    if circle_bool:
+        mask = ~circle_mask(x, y, cx, cy, r)
+        x = x[mask].reshape(-1, 1)
+        y = y[mask].reshape(-1, 1)
+        t = t[mask].reshape(-1, 1)
+    return x.to(device), y.to(device), t.to(device)
 
-def sphere_noslip_mask(x, y):
-    """Mask of points INSIDE the cylinder."""
-    return ((x - xc)**2 + (y - yc)**2) < r**2
+def sample_initial_conditions(N):
+    x = torch.rand(N, 1)*(x_ub-x_lb) + x_lb
+    y = torch.rand(N, 1)*(y_ub-y_lb) + y_lb
+    t = torch.zeros(N, 1, device=device)
+    #gaussian U centered in the domain
+    u = hp.A*torch.exp(-((x-hp.x_gauss)**2 + (y-hp.y_gauss)**2)/hp.sigma**2)
+    #gaussian V centered in the domain
+    v = hp.A*torch.exp(-((x-hp.x_gauss)**2 + (y-hp.y_gauss)**2)/hp.sigma**2)
+    # v= torch.zeros_like(u)
+    
+    if circle_bool:
+        mask = ~circle_mask(x, y, cx, cy, r)
+        x = x[mask].reshape(-1, 1)
+        y = y[mask].reshape(-1, 1)
+        t = t[mask].reshape(-1, 1)
+        u = u[mask].reshape(-1, 1)
+        v = v[mask].reshape(-1, 1)
+        
+    return x.to(device), y.to(device), t.to(device), u.to(device), v.to(device)
 
-def compute_phi(x, y):
-    """Signed‐distance from obstacle boundary."""
-    return torch.sqrt((x - xc)**2 + (y - yc)**2) - r
+def sample_initial_conditions2(x, y):
+    #gaussian U centered in the domain
+    u = hp.A*torch.exp(-((x-hp.x_gauss)**2 + (y-hp.y_gauss)**2)/hp.sigma**2)
+    #gaussian V centered in the domain
+    v = hp.A*torch.exp(-((x-hp.x_gauss)**2 + (y-hp.y_gauss)**2)/hp.sigma**2)
+    return u, v
 
-# ── Sampling utilities ──────────────────────────────────────────────────────────
+def sample_circle(N):
+    theta = torch.rand(N, 1)*(2*np.pi)
+    r = torch.sqrt(torch.rand(N, 1)) * (x_ub-x_lb)/2
+    x = cx + r * torch.cos(theta)
+    y = cy + r * torch.sin(theta)
+    t = torch.rand(N, 1)*(t_ub-t_lb) + t_lb
+    return x.to(device), y.to(device), t.to(device)
 
-def sample_outside(N):
-    """Exactly N points uniformly outside the obstacle."""
-    xs, ys, ts = [], [], []
-    count = 0
-    while count < N:
-        m = N - count
-        X = torch.rand(m,1, device=device)*(x_ub - x_lb) + x_lb
-        Y = torch.rand(m,1, device=device)*(y_ub - y_lb) + y_lb
-        T = torch.rand(m,1, device=device)*(t_ub - t_lb) + t_lb
-        mask = ~sphere_noslip_mask(X, Y)
-        if mask.any():
-            Xm = X[mask].view(-1,1)
-            Ym = Y[mask].view(-1,1)
-            Tm = T[mask].view(-1,1)
-            xs.append(Xm); ys.append(Ym); ts.append(Tm)
-            count += Xm.shape[0]
-    x = torch.cat(xs, 0)[:N]
-    y = torch.cat(ys, 0)[:N]
-    t = torch.cat(ts, 0)[:N]
-    return x, y, t
+def sample_dirichlet(N):
+    #incremento i bound di un epsilon
+    eps = 0.0
+    x_lb1, x_ub1, y_lb1, y_ub1 = x_lb+eps, x_ub-eps, y_lb+eps, y_ub-eps
+    # basso: y = y_lb, x in [x_lb,x_ub]
+    xb = torch.rand(N,1,device=device)*(x_ub1-x_lb1) + x_lb1
+    yb = torch.full((N,1), y_lb1, device=device)
+    tb = torch.rand(N,1,device=device)*(t_ub-t_lb) + t_lb
 
-def sample_ic(N):
-    x, y, t = sample_outside(N)
-    phi = compute_phi(x, y)
-    u0 = torch.zeros_like(x)
-    v0 = torch.zeros_like(x)
-    return x, y, t, phi, u0, v0
+    # alto: y = y_ub
+    xt = torch.rand(N,1,device=device)*(x_ub1-x_lb1) + x_lb1
+    yt = torch.full((N,1), y_ub1, device=device)
+    tt = torch.rand(N,1,device=device)*(t_ub-t_lb) + t_lb
 
-def sample_collocation(N, delta=0.05):
-    N_far  = int(0.8 * N)
-    N_near = N - N_far
+    # sinistra: x = x_lb
+    xl = torch.full((N,1), x_lb1, device=device)
+    yl = torch.rand(N,1,device=device)*(y_ub1-y_lb1) + y_lb1
+    tl = torch.rand(N,1,device=device)*(t_ub-t_lb) + t_lb
 
-    xf, yf, tfar = sample_outside(N_far)
-    phi_far = compute_phi(xf, yf)
+    # destra: x = x_ub
+    xr = torch.full((N,1), x_ub1, device=device)
+    yr = torch.rand(N,1,device=device)*(y_ub1-y_lb1) + y_lb1
+    tr = torch.rand(N,1,device=device)*(t_ub-t_lb) + t_lb
 
-    xs, ys, ts = [], [], []
-    count = 0
-    while count < N_near:
-        m = N_near - count
-        X = torch.rand(m,1, device=device)*(x_ub - x_lb) + x_lb
-        Y = torch.rand(m,1, device=device)*(y_ub - y_lb) + y_lb
-        T = torch.rand(m,1, device=device)*(t_ub - t_lb) + t_lb
-        phi = compute_phi(X, Y)
-        mask = phi.abs() < delta
-        if mask.any():
-            Xm = X[mask].view(-1,1)
-            Ym = Y[mask].view(-1,1)
-            Tm = T[mask].view(-1,1)
-            xs.append(Xm); ys.append(Ym); ts.append(Tm)
-            count += Xm.shape[0]
+    # concateno tutto
+    x_bc = torch.cat([xb, xt, xl, xr], dim=0).requires_grad_(True)
+    y_bc = torch.cat([yb, yt, yl, yr], dim=0).requires_grad_(True)
+    t_bc = torch.cat([tb, tt, tl, tr], dim=0).requires_grad_(True)
+    return x_bc, y_bc, t_bc
 
-    x_near = torch.cat(xs, 0)[:N_near]
-    y_near = torch.cat(ys, 0)[:N_near]
-    t_near = torch.cat(ts, 0)[:N_near]
-    phi_near = compute_phi(x_near, y_near)
-
-    x = torch.cat([xf, x_near], dim=0)
-    y = torch.cat([yf, y_near], dim=0)
-    t = torch.cat([tfar, t_near], dim=0)
-    phi = torch.cat([phi_far, phi_near], dim=0)
-    return x, y, t, phi
-
-def sample_walls(N):
-    # bottom wall
-    x1 = torch.rand(N,1, device=device)*(x_ub - x_lb) + x_lb
-    y1 = torch.full((N,1), y_lb, device=device)
-    t1 = torch.rand(N,1, device=device)*(t_ub - t_lb) + t_lb
-    # top wall
-    x2 = torch.rand(N,1, device=device)*(x_ub - x_lb) + x_lb
-    y2 = torch.full((N,1), y_ub, device=device)
-    t2 = torch.rand(N,1, device=device)*(t_ub - t_lb) + t_lb
-
-    x = torch.cat([x1, x2], dim=0)
-    y = torch.cat([y1, y2], dim=0)
-    t = torch.cat([t1, t2], dim=0)
-    phi = compute_phi(x, y)
-    return x, y, t, phi
-
-def sample_obstacle(N):
-    xs, ys, ts = [], [], []
-    count = 0
-    while count < N:
-        m = N - count
-        X = torch.rand(m,1, device=device)*(x_ub - x_lb) + x_lb
-        Y = torch.rand(m,1, device=device)*(y_ub - y_lb) + y_lb
-        T = torch.rand(m,1, device=device)*(t_ub - t_lb) + t_lb
-        mask = sphere_noslip_mask(X, Y)
-        if mask.any():
-            Xm = X[mask].view(-1,1)
-            Ym = Y[mask].view(-1,1)
-            Tm = T[mask].view(-1,1)
-            xs.append(Xm); ys.append(Ym); ts.append(Tm)
-            count += Xm.shape[0]
-    x = torch.cat(xs, 0)[:N]
-    y = torch.cat(ys, 0)[:N]
-    t = torch.cat(ts, 0)[:N]
-    phi = compute_phi(x, y)
-    return x, y, t, phi
-
-def sample_inlet(N):
-    x   = torch.full((N,1), x_lb, device=device)
-    y   = torch.rand(N,1, device=device)*(y_ub - y_lb) + y_lb
-    t   = torch.rand(N,1, device=device)*(t_ub - t_lb) + t_lb
-    phi = compute_phi(x, y)
-    U_inf = hp.U_INLET
-    Ut    = U_inf * (1 - torch.exp(-5*(t - t_lb)))
-    Vt    = torch.zeros_like(Ut)
-    return x, y, t, phi, Ut, Vt
-
-def sample_outlet(N):
-    x   = torch.full((N,1), x_ub, device=device)
-    y   = torch.rand(N,1, device=device)*(y_ub - y_lb) + y_lb
-    t   = torch.rand(N,1, device=device)*(t_ub - t_lb) + t_lb
-    phi = compute_phi(x, y)
-    return x, y, t, phi
-
-# ── LSTM‐PINN model ─────────────────────────────────────────────────────────────
-
+# 4) Define LSTM‐PINN model
 class LSTM_PINN_NS2D(nn.Module):
-    def __init__(self, hidden_size, num_layers):
+    def __init__(self, input_size, hidden_size, num_layers):
         super().__init__()
-        self.rnn = nn.LSTM(4, hidden_size, num_layers, batch_first=True)
-        self.fc  = nn.Linear(hidden_size, 3)
-
-    def forward(self, x, y, t, phi):
-        # ensure proper shape
-        x   = x.view(-1,1); y   = y.view(-1,1)
-        t   = t.view(-1,1); phi = phi.view(-1,1)
-        seq = torch.cat([x, y, t, phi], dim=-1).unsqueeze(1)  # [B,1,4]
-        h, _ = self.rnn(seq)                                  # [B,1,H]
-        uvp  = self.fc(h[:, -1, :])                           # [B,3]
+        self.rnn = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.output_layer =nn.Sequential(
+            nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+            # nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+            # nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+            # nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+            # nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+            # nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+            # nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, 3))
+    def forward(self, x, y, t):
+        seq = torch.cat([x,y,t], dim=-1).unsqueeze(1)
+        h, _ = self.rnn(seq)
+        uvp = self.output_layer(h[:, -1])
         return uvp[:,0:1], uvp[:,1:2], uvp[:,2:3]
 
-model = LSTM_PINN_NS2D(hidden_size, num_layers).to(device)
+model = LSTM_PINN_NS2D(input_size, hidden_size, num_layers).to(device)
 
-# ── Physics residual & losses ─────────────────────────────────────────────────
-
-def NS_res(x, y, t, phi):
-    x = x.clone().detach().requires_grad_(True)
-    y = y.clone().detach().requires_grad_(True)
-    t = t.clone().detach().requires_grad_(True)
-    phi = phi.clone().detach()
-
-    u, v, p = model(x, y, t, phi)
+# 5) PDE residuals
+def NS_res(x,y,t):
+    for g in (x,y,t): g.requires_grad_(True)
+    u,v,p = model(x,y,t)
     ones = torch.ones_like(u)
-
     u_t = torch.autograd.grad(u, t, grad_outputs=ones, create_graph=True)[0]
     v_t = torch.autograd.grad(v, t, grad_outputs=ones, create_graph=True)[0]
-
     u_x = torch.autograd.grad(u, x, grad_outputs=ones, create_graph=True)[0]
     u_y = torch.autograd.grad(u, y, grad_outputs=ones, create_graph=True)[0]
     v_x = torch.autograd.grad(v, x, grad_outputs=ones, create_graph=True)[0]
     v_y = torch.autograd.grad(v, y, grad_outputs=ones, create_graph=True)[0]
     p_x = torch.autograd.grad(p, x, grad_outputs=ones, create_graph=True)[0]
     p_y = torch.autograd.grad(p, y, grad_outputs=ones, create_graph=True)[0]
-
     u_xx = torch.autograd.grad(u_x, x, grad_outputs=ones, create_graph=True)[0]
     u_yy = torch.autograd.grad(u_y, y, grad_outputs=ones, create_graph=True)[0]
     v_xx = torch.autograd.grad(v_x, x, grad_outputs=ones, create_graph=True)[0]
     v_yy = torch.autograd.grad(v_y, y, grad_outputs=ones, create_graph=True)[0]
+    continuity = u_x + v_y
+    pu = u_t + (u*u_x + v*u_y) + p_x - nu*(u_xx+u_yy)
+    pv = v_t + (u*v_x + v*v_y) + p_y - nu*(v_xx+v_yy)
+    umean = torch.mean(u)
+    vmean = torch.mean(v)
+    entropy = (u-umean)*pu + (v-vmean)*pv
+    return pu, pv, continuity, entropy
 
-    cont = u_x + v_y
-    ru   = u_t + (u*u_x + v*u_y) + p_x - nu*(u_xx + u_yy)
-    rv   = v_t + (u*v_x + v*v_y) + p_y - nu*(v_xx + v_yy)
-
-    return ru, rv, cont
-
+# 6) Loss
 mse = nn.MSELoss()
+working = False
+xi = torch.rand(N_ic, 1)*(x_ub-x_lb) + x_lb
+yi = torch.rand(N_ic, 1)*(y_ub-y_lb) + y_lb
+ti = torch.zeros(N_ic, 1, device=device)
+xi, yi, ti = xi.to(device), yi.to(device), ti.to(device)
+xb, yb, tb = sample_dirichlet(5000)
+x, y, t = sample_collocation(20000)
 
-def compute_losses():
-    x0, y0, t0, phi0, u0_tgt, v0_tgt = sample_ic(N_ic)
-    u0, v0, _ = model(x0, y0, t0, phi0)
-    L_ic = mse(u0, u0_tgt) + mse(v0, v0_tgt)
+def loss_functions():
+    
+    ui, vi = sample_initial_conditions2(xi, yi)
+    u_pred, v_pred, _ = model(xi, yi, ti)
+    L_ic = mse(u_pred, ui) + mse(v_pred, vi)
+    u_bc, v_bc, _ = model(xb, yb, tb)
+    L_bc = mse(u_bc, torch.zeros_like(u_bc)) + mse(v_bc, torch.zeros_like(v_bc))
+    pu, pv, continuity, entropy = NS_res(x,y,t)
+    L_pde = mse(pu, torch.zeros_like(pu)) + mse(pv, torch.zeros_like(pv)) + mse(continuity, torch.zeros_like(continuity))
+    L_e = mse(entropy, torch.zeros_like(entropy))
+    
+    if circle_bool:
+            xc, yc, tc = sample_circle(5000)
+            u_c, v_c, _ = model(xc, yc, tc)
+            L_bc += (mse(u_c, torch.zeros_like(u_c)) + mse(v_c, torch.zeros_like(v_c)))*0.1
+    
+    loss = L_ic+L_bc
+    
+    return loss, L_ic, L_ic, L_ic
 
-    xc, yc, tc, phi_c = sample_collocation(N_colloc)
-    ru, rv, cont = NS_res(xc, yc, tc, phi_c)
-    L_pde = mse(ru, torch.zeros_like(ru)) \
-          + mse(rv, torch.zeros_like(rv)) \
-          + mse(cont, torch.zeros_like(cont))
-
-    xw, yw, tw, phi_w = sample_walls(N_walls)
-    uw, vw, _ = model(xw, yw, tw, phi_w)
-    L_walls = mse(uw, torch.zeros_like(uw)) + mse(vw, torch.zeros_like(vw))
-
-    xo, yo, to, phi_o = sample_obstacle(N_obs)
-    uo, vo, _ = model(xo, yo, to, phi_o)
-    L_obs = mse(uo, torch.zeros_like(uo)) + mse(vo, torch.zeros_like(vo))
-
-    xi, yi, ti, phi_i, Ut, Vt = sample_inlet(N_inlet)
-    ui, vi, _ = model(xi, yi, ti, phi_i)
-    L_inlet  = mse(ui, Ut) + mse(vi, Vt)
-
-    xo2, yo2, to2, phi_o2 = sample_outlet(N_outlet)
-    _, _, po = model(xo2, yo2, to2, phi_o2)
-    L_outlet = mse(po, torch.zeros_like(po))
-
-    L = (
-        lambda_ic    * L_ic
-      + lambda_pde   * L_pde
-      + lambda_walls * L_walls
-      + lambda_obs   * L_obs
-      + lambda_inlet * L_inlet
-      + lambda_outlet* L_outlet
-    )
-    return L, L_ic, L_pde, L_walls, L_obs, L_inlet, L_outlet
-
-# ── Training ───────────────────────────────────────────────────────────────────
-
-def train():
-    opt     = torch.optim.Adam(model.parameters(), lr=lr)
-    history = {k:[] for k in ["total","ic","pde","walls","obs","inlet","outlet"]}
-
-    for ep in range(1, epochs+1):
+# 7) Training loop
+epoche = 400
+def train_noBatches():
+    history={
+        "total_loss": [],
+        "pde_loss": [],
+        "bc_loss": [],
+        "ic_loss": [],
+        "obs_loss": []}
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    #pretrain on initial conditions
+    for ep in range(1, epoche+1):
         opt.zero_grad()
-        losses = compute_losses()
-        losses[0].backward()
+        loss, L_ic, L_bc, L_pde = loss_functions()
+        loss.backward()
         opt.step()
-        for key, val in zip(history.keys(), losses):
-            history[key].append(val.item())
-        if ep % 20 == 0:
-            print(f"Epoch {ep}/{epochs} | "
-                  f"Total={losses[0]:.3e} IC={losses[1]:.3e} PDE={losses[2]:.3e} "
-                  f"Walls={losses[3]:.3e} Obs={losses[4]:.3e} "
-                  f"Inlet={losses[5]:.3e} Outlet={losses[6]:.3e}")
+        if ep % 10 == 0:
+            print(f"Ep {ep}/{epoche}: loss={loss.item():.2e}, loss pde={L_pde.item():.2e}, loss bc={L_bc.item():.2e}, loss ic={L_ic.item():.2e}")
+    if hp.SAVE_MODEL:
+        try:
+            os.remove("models/LSTM_NS2d_tg_cyl.pth")
+        except OSError:
+            pass
+        torch.save(model.state_dict(), "models/LSTM_NS2d_tg_cyl.pth")
+        print("Model saved to models/LSTM_NS2d_tg_cyl.pth")
+    if hp.SAVE_LOSS:
+        try:
+            os.remove("models/LSTM_NS2d_tg_cyl_loss.npy")
+        except OSError:
+            pass
+        np.save("models/LSTM_NS2d_tg_cyl_loss.npy", history)
+        print("Loss saved to models/LSTM_NS2d_tg_cyl_loss.npy")
 
-    os.makedirs("models", exist_ok=True)
-    torch.save(model.state_dict(), "models/LSTM_NS2d_improved.pth")
-    np.save("loss/loss_NS2d_improved.npy", history)
-    print("✔ Model and loss history saved ✔")
 
-if __name__ == "__main__":
-    train()
+if __name__ == '__main__':
+    os.makedirs('models', exist_ok=True)
+    os.makedirs("loss", exist_ok=True)
+    train_noBatches()
+    import LSTM_NS_2d_analysis as an
+    an.plotModel()
+    # train()
