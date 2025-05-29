@@ -57,13 +57,13 @@ def sample_initial_conditions(N):
     v = hp.A*torch.exp(-((x-hp.x_gauss)**2 + (y-hp.y_gauss)**2)/hp.sigma**2)
     # v= torch.zeros_like(u)
     
-    if circle_bool:
-        mask = ~circle_mask(x, y, cx, cy, r)
-        x = x[mask].reshape(-1, 1)
-        y = y[mask].reshape(-1, 1)
-        t = t[mask].reshape(-1, 1)
-        u = u[mask].reshape(-1, 1)
-        v = v[mask].reshape(-1, 1)
+    # if circle_bool:
+    #     mask = ~circle_mask(x, y, cx, cy, r)
+    #     x = x[mask].reshape(-1, 1)
+    #     y = y[mask].reshape(-1, 1)
+    #     t = t[mask].reshape(-1, 1)
+    #     u = u[mask].reshape(-1, 1)
+    #     v = v[mask].reshape(-1, 1)
         
     return x.to(device), y.to(device), t.to(device), u.to(device), v.to(device)
 
