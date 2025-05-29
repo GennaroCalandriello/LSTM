@@ -1,13 +1,6 @@
-import torch
-import torch.nn as nn
-import os
+from hyperpar import *
+
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'  # Avoids KMP duplicate lib error
-
-import numpy as np
-
-from scipy.interpolate import griddata
-
-import matplotlib.pyplot as plt
 
 # References: [1] Is the Neural tangent kernel of PINNs deep learning general PDE always convergent? https://arxiv.org/abs/2412.06158
 # [2] *When and why PINNs fail to train: A NTK perspective https://arxiv.org/pdf/2007.14527
@@ -19,53 +12,6 @@ import matplotlib.pyplot as plt
 #modifica la funzione r(x, a, c) e il sampler dei residui
 #80000 epoche ottengo un errore assoluto massimo di 0.08 su un dominio [0,1]x[0,1] con a=0.5 e c=2
 
-# CUDA support 
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-    print('CUDA')
-else:
-    device = torch.device('cpu')
-    print('CPU')
-
-#save name of string
-save_model = "pinn_model2d_2.pth"
-save_loss = "pinn_loss2d_2.npy"
-
-#hyperparameters
-x_lb = 0.0
-x_ub = 2.0
-ylb = 0.0
-yub = 2.0
-t_lb = 0.0
-t_ub = 1.0
-nu = 0.01 # Wave constant
-
-# ics_coord  = np.array([[0.0, 0.0, 0.0],[0.0, 1.0, 1.0]])
-# bc1_coord  = np.array([[0.0, 0.0, 0.0],[1.0, 0.0, 1.0]])
-# bc2_coord  = np.array([[0.0, 1.0, 0.0],[1.0, 1.0, 1.0]])
-# bc3_coord  = np.array([[0.0, 0.0, 0.0],[1.0, 1.0, 0.0]])
-# bc4_coord  = np.array([[0.0, 0.0, 1.0],[1.0, 1.0, 1.0]])
-# dom_coord  = np.array([[0.0, 0.0, 0.0],[1.0, 1.0, 1.0]])
-
-
-# ics_coord = np.array([[0, 0, 0], [0, 1, 1]])  # Initial condition coordinates
-# dom_coord = np.array([[0, 0, 0], [1, 1, 1]])  # Domain coordinates
-#■ it's a square!!-----------------------■
-# bc1_coord  = np.array([[0.0, 0.0, 0.0],[1.0, 0.0, 1.0]])
-# bc2_coord  = np.array([[0.0, 1.0, 0.0],[1.0, 1.0, 1.0]])
-# bc3_coord  = np.array([[0.0, 0.0, 0.0],[1.0, 1.0, 0.0]])
-# bc4_coord  = np.array([[0.0, 0.0, 1.0],[1.0, 1.0, 1.0]]) #|
-#■---------------------------------------■
-
-bc1_coord = np.array([[t_lb, x_lb, ylb], [t_ub, x_lb, yub]])
-bc2_coord = np.array([[t_lb, x_ub, ylb], [t_ub, x_ub, yub]])
-bc3_coord = np.array([[t_lb, x_lb, yub], [t_ub, x_lb, yub]])
-bc4_coord = np.array([[t_lb, x_ub, yub], [t_ub, x_ub, yub]])
-dom_coord = np.array([[t_lb, x_lb, ylb], [t_ub, x_ub, yub]])
-ics_coord = np.array([[t_lb, x_lb, ylb], [t_ub, x_ub, yub]])
-
-scheduler_step = 1000 # Number of steps to update the learning rate
-ntk_step = 100 # Number of steps to compute the NTK matrix
 
 class Sampler:
     # Initialize the class
@@ -200,26 +146,27 @@ class PINN:
             grad_outputs = torch.ones_like(y)
         grad = torch.autograd.grad(y, [x], grad_outputs = grad_outputs, create_graph=True, allow_unused=True)[0]
         return grad
-
-    # Compute Jacobian for each weights and biases in each layer and return a list 
-    # def compute_jacobian(self, output, params):
-    #     output = output.reshape(-1)
-    #     J_dum = []
-    #     J_List = []
-    #     for i in range(len(params)):
-    #         grad, = torch.autograd.grad(output, params[i], (torch.eye(output.shape[0]).to(device),),retain_graph=True, allow_unused=True, is_grads_batched=True)
-    #         if grad == None:
-    #             print("yess")
-    #             pass
-    #         else:
-    #             J_dum.append(grad)
-
-    #             J_List.append(torch.cat((J_dum[i-1].flatten().reshape(len(output),-1),grad.flatten().reshape(len(output),-1)), 1))
-    #     # print("J dimensions: ", len(J_List), J_List[0].shape)
-    #     return J_List
     
     def compute_jacobian(self, output, params):
         
+        if use_only_first_layer_NTK:
+            
+            output = output.reshape(-1)
+            J_dum = []
+            J_List = []
+            for i in range(len(params)):
+                grad, = torch.autograd.grad(output, params[i], (torch.eye(output.shape[0]).to(device),),retain_graph=True, allow_unused=True, is_grads_batched=True)
+                if grad == None:
+                    print("yess")
+                    pass
+                else:
+                    J_dum.append(grad)
+
+                    J_List.append(torch.cat((J_dum[i-1].flatten().reshape(len(output),-1),grad.flatten().reshape(len(output),-1)), 1))
+            # print("J dimensions: ", len(J_List), J_List[0].shape)
+            return J_List
+        
+        else: ###!!!!WARNING: memory allocation increases exponentially with the number of parameters in the network
             output = output.reshape(-1)
             jacobians = []
             full_jacobian = None
@@ -314,7 +261,7 @@ class PINN:
             loss_rv = torch.mean(rv_pred ** 2)
 
             # loss = self.lam_r_val * loss_res + self.lam_u_val * loss_bcs + self.lam_ut_val * loss_ics_u_t 
-            loss =self.lam_ru_val*loss_ru +self.lam_rv_val*loss_rv+ self.lam_ic_val * loss_ics #+ self.lam_bc_val * loss_bcs
+            loss =self.lam_ru_val*loss_ru +self.lam_rv_val*loss_rv+ self.lam_ic_val * loss_ics +self.lam_bc_val * loss_bcs
             # Backward and optimize 
             self.optimizer_Adam.zero_grad()
             loss.backward()
@@ -344,7 +291,7 @@ class PINN:
           
             if log_NTK:
                 
-                if it % 50 == 0:
+                if it % ntk_step == 0:
                     print("Compute NTK...")
                     X_bc_batch = np.vstack([X_ics_batch, X_bc1_batch, X_bc2_batch, X_bc3_batch, X_bc4_batch])
                     X_ics_batch, uv_ics_batch = self.fetch_minibatch(self.ics_sampler, batch_size )
@@ -392,7 +339,7 @@ class PINN:
                     K_ru_value = K_ru_value.detach().cpu().numpy()
                     K_rv_value = K_rv_value.detach().cpu().numpy()
                     
-                    trace_K = np.trace(K_ic_value) + np.trace(K_ru_value) + np.trace(K_rv_value) #+ np.trace(K_bc_value)
+                    trace_K = np.trace(K_ic_value) + np.trace(K_ru_value) + np.trace(K_rv_value)+ np.trace(K_bc_value)
   
                     # Store Trace values
                     self.K_bc_log.append(K_bc_value)
@@ -473,6 +420,27 @@ def v(x, nu):
     
     return np.sin(np.pi * yc) * np.cos(np.pi * xc)
 
+def u_bc(x, nu):
+    """
+    :param x: x = (t, x)
+    """
+    tc = x[:,0:1]
+    xc = x[:,1:2]
+    yc = x[:,2:3]
+    
+    
+    return np.sin(np.pi * xc) * np.cos( np.pi * yc)* np.exp(-nu * np.pi**2 * tc)
+
+def v_bc(x, nu):
+    """
+    :param x: x = (t, x)
+    """
+    tc = x[:,0:1]
+    xc = x[:,1:2]
+    yc = x[:,2:3]
+    
+    return np.sin(np.pi * yc) * np.cos(np.pi * xc)* np.exp(-nu * np.pi**2 * tc)
+
 def r(u_tt):
     zerores = np.zeros((u_tt.shape[0], 1))
     return zerores
@@ -512,24 +480,23 @@ def operator(u, v, t, x, y, nu, sigma_t=1.0, sigma_x=1.0, sigma_y=1.0):
 # Example code for samplers in 2D Burgers:
 zero_bc = lambda x: np.zeros((x.shape[0], 2))
 ics_sampler = Sampler(3, ics_coord, lambda x: np.hstack([u(x, nu), v(x, nu)]), name='ICs')
-# bc1_sampler = Sampler(3, bc1_coord, lambda x: np.hstack([u(x, nu), v(x, nu)]), name='BC1')
-# bc2_sampler = Sampler(3, bc2_coord, lambda x: np.hstack([u(x, nu), v(x, nu)]), name='BC2')
-# bc3_sampler = Sampler(3, bc3_coord, lambda x: np.hstack([u(x, nu), v(x, nu)]), name='BC3')
-# bc4_sampler = Sampler(3, bc4_coord, lambda x: np.hstack([u(x, nu), v(x, nu)]), name='BC4')
+bc1_sampler = Sampler(3, bc1_coord, lambda x: np.hstack([u_bc(x, nu), v_bc(x, nu)]), name='BC1')
+bc2_sampler = Sampler(3, bc2_coord, lambda x: np.hstack([u_bc(x, nu), v_bc(x, nu)]), name='BC2')
+bc3_sampler = Sampler(3, bc3_coord, lambda x: np.hstack([u_bc(x, nu), v_bc(x, nu)]), name='BC3')
+bc4_sampler = Sampler(3, bc4_coord, lambda x: np.hstack([u_bc(x, nu), v_bc(x, nu)]), name='BC4')
 
-bc1_sampler = Sampler(3, bc1_coord,  zero_bc, name='BC1')
-bc2_sampler = Sampler(3, bc2_coord, zero_bc, name='BC2')
-bc3_sampler = Sampler(3, bc3_coord, zero_bc, name='BC3')
-bc4_sampler = Sampler(3, bc4_coord,  zero_bc, name='BC4')
+# bc1_sampler = Sampler(3, bc1_coord,  zero_bc, name='BC1')
+# bc2_sampler = Sampler(3, bc2_coord, zero_bc, name='BC2')
+# bc3_sampler = Sampler(3, bc3_coord, zero_bc, name='BC3')
+# bc4_sampler = Sampler(3, bc4_coord,  zero_bc, name='BC4')
 bcs_sampler = [bc1_sampler, bc2_sampler, bc3_sampler, bc4_sampler]
 res_sampler = Sampler(3, dom_coord, lambda x: np.zeros((x.shape[0],2)), name='Residuals')
 
 #PINN model
 
-layers = [3, 30, 30, 30, 2]
-kernel_size = 100
+
 model = PINN(layers, operator, ics_sampler, bcs_sampler, res_sampler,nu, kernel_size)
-iterations = 40000 #epochs
+
 
 
 def main():     
@@ -538,8 +505,7 @@ def main():
     if train_bool:
         print("Training the model...")
         
-        log_NTK = True
-        update_lam = True
+        
 
         model.train(iterations, batch_size=kernel_size, log_NTK=log_NTK, update_lam=update_lam)
 

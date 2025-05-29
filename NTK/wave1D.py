@@ -447,7 +447,7 @@ def main():
     #train
     if train_bool:
         print("Training the model...")
-        iterations = 80000
+        iterations = 40000
         log_NTK = True
         update_lam = True
 
@@ -550,28 +550,36 @@ def animate_plot():
     with torch.no_grad():
         u_pred = model.predict_u(pts)           # assume returns shape (Nx*Nt,1)
     U = griddata(pts, u_pred.ravel(), (T, X), method='cubic')
+    U_exact = griddata(pts, u(pts, a, c).ravel(), (T, X), method='cubic')  # exact solution
     # U now shape (Nx, Nt)
 
     # 4) set up the figure
     fig, ax = plt.subplots(figsize=(8,4))
     line, = ax.plot(x_lin, U[:,0], lw=2)
+    line_exact, = ax.plot(x_lin, U_exact[:,0], lw=2, linestyle='--', color='orange')
     title = ax.text(0.5,1.05, '', transform=ax.transAxes, ha='center')
     ax.set_xlim(x_lin[0], x_lin[-1])
     ax.set_ylim(np.min(U), np.max(U))
     ax.set_xlabel('x')
     ax.set_ylabel('u')
+    plt.legend(['Predicted u(t,x)', 'Exact u(t,x)'], loc='upper right')
+    #grid
+    ax.grid(True)
+    plt.tight_layout()
 
     # 5) update function
     def update(frame):
         line.set_ydata(U[:, frame])
+        line_exact.set_ydata(U_exact[:, frame])
         title.set_text(f'time = {t_lin[frame]:.3f}')
-        return line, title
+        return line, line_exact, title
 
     # 6) animation
     ani = animation.FuncAnimation(
         fig, update, frames=Nt, interval=50, blit=True, repeat=True
     )
     plt.show()
+    ani.save("wave 1D.gif", writer='pillow', fps=30, dpi=100)
     return ani
     
 if __name__ == '__main__':
@@ -579,7 +587,7 @@ if __name__ == '__main__':
     #load the model
     # main()
     # plot_loss()
-    plot()
+    # plot()
     animate_plot()
       
                     
